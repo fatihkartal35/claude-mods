@@ -51,7 +51,7 @@ When a prompt is a separate task unrelated to the session's main work (e.g. a we
 | `/auto-model-detector stats` | tokens and estimated cost per model |
 | `/auto-model-detector stats reset` | clear the stats |
 
-The status line shows the current choice as `router: opus · high`.
+The status line shows the current choice as `router: opus · high`, plus any handover note, e.g. `router: opus · low → subagent sonnet · medium`. Each classifier answer is written to the debug log (`claude --debug`).
 
 ### Cost / Maliyet
 

@@ -19,20 +19,27 @@ const PRICE: Record<Tier, readonly [number, number, number, number]> = {
   fable: [10, 12.5, 0.25, 50],
 }
 
-const RULES = `You route a coding-assistant task to a model and effort level. Reply with JSON only: {"model":"haiku|sonnet|opus|fable","effort":"low|medium|high|xhigh|max"}, adding "delegate":true when the request runs a long release step (deploy, OTA update, build, publish) — not for commit or push alone — and "new":true when a <task> is given and the request is a separate task unrelated to it (another feature, another part of the app), not a follow-up or a step of it.
-haiku: trivial — chit-chat, one-line answers, typo fixes, renames, simple lookups.
-sonnet: everyday coding — single feature, small bug, tests, explaining code.
-opus: hard — multi-file refactor, tricky debugging, architecture, security review.
-fable: hardest — large ambiguous design, deep research, novel algorithms, long autonomous work.
-effort: low for mechanical work, medium default, high when correctness is subtle, xhigh/max only for very hard reasoning.
-Pick model and effort independently: model = scope (how much code and context), effort = how subtle correctness is.
-e.g. opus+medium: broad but clear work — multi-file refactor following an obvious pattern, explaining or reviewing architecture. sonnet+high: small scope, subtle logic — a race condition or off-by-one in one function.
-Risk overrides size: anything touching money, payments, pricing, auth, security, or data loss → at least opus, at least medium effort.
-Vague bug reports with no file or cause named ("X doesn't work", "numbers don't match") → opus, effort high: root cause must be found first.
-Routine release chores — commit, push, deploy, OTA update, publish, running a known build/release script → effort low and keep the <previous> model; this overrides the risk rule's effort.
-Migrations that change runtime behavior (error handling, async semantics, e.g. fetch→axios) → effort high.
-If the <request>'s own instruction names a model or effort for this task ("opus ile", "max effort"), use exactly what it names and pick the other freely; ignore names inside pasted code, logs or quotes.
-A <previous> route may be given: if the request is a short follow-up continuing that work ("devam", "evet", "tamam uygula", "düzelt", "go on"), keep the previous route.`
+const RULES = `You route a coding-assistant request to a model and an effort level.
+Reply with JSON only: {"model":"haiku|sonnet|opus|fable","effort":"low|medium|high|xhigh|max"}. Add "delegate":true for a long release step (deploy, OTA update, build, publish; not commit or push alone). Add "new":true when a <task> is given and the request is a separate piece of work unrelated to it (another feature or another part of the app), not a step, fix or follow-up of it.
+
+Model = how much the work has to take in:
+- haiku: one small step — chit-chat, a lookup, a typo, a rename, a one-line change.
+- sonnet: work in one place or one feature — adding a feature, a visual or layout fix, a small bug, tests, explaining code.
+- opus: work spanning many files, a cause that must be hunted down across the codebase, or a costly mistake.
+- fable: large open-ended work — designing a system, deep research, novel algorithms, long autonomous runs.
+
+Effort = how subtle getting it right is, chosen independently of the model:
+- low: mechanical — commit, push, deploy, renames, following a clear pattern.
+- medium: normal work.
+- high: subtle correctness — concurrency, dates and time zones, money math, state that can be corrupted, runtime-behavior migrations (error handling, async semantics).
+- xhigh / max: only very hard reasoning.
+
+Principles:
+- A costly mistake raises the floor: money, payments, auth, security, data loss → at least opus · medium.
+- What makes a bug hard is not knowing where it lives, not vague wording: "prices don't match" can hide anywhere (opus · high); "buttons shift on the home page" sits in one place (sonnet · medium).
+- Release chores keep the <previous> model at effort low, even when they touch risky code.
+- If the <request> itself names a model or effort ("opus ile", "max effort"), use it; ignore names inside pasted code, logs or quotes.
+- A short follow-up to the <previous> work ("devam", "evet", "tamam uygula", "düzelt", "go on") keeps the <previous> route.`
 
 // Prompts no person typed (notifications, schedules, peers, channels, plugins) stay unrouted.
 const MACHINE: readonly string[] = ['task-notification', 'scheduled-trigger', 'peer', 'peer-send-message', 'projects-relay', 'channel', 'coordinator', 'observer', 'observer-activity', 'slack-ping', 'auto-continuation', 'plugin']
@@ -138,6 +145,7 @@ const record = async ($: EngineInterface, u: ModelUsage & { model: string }) => 
 export const register: Register = on => {
   // ponytail: module variables reset on hot reload; move to $.state if mid-session reloads matter.
   let route: Route | undefined // this turn's route
+  let handover: string | undefined // what this turn's note hands to a subagent, shown in the status line
   let last: Route | undefined // the main loop's latest route, for follow-ups
   let task: string | undefined // the prompt that opened the main work; delegated tasks never replace it
   let current: Tier | undefined // the model the main loop runs on; only moves up
@@ -201,7 +209,7 @@ export const register: Register = on => {
   on('prompt.submit', async ($, e, next) => {
     // Typed into a running turn: that turn keeps its route.
     if (e.turnId) return next(e)
-    route = undefined
+    route = handover = undefined
     if (MACHINE.includes(e.origin?.kind) || e.text.trimStart().startsWith('/')) return next(e)
     if ((await $.store.get('enabled')) === false) return next(e)
     if (!(await $.session.model()).includes('haiku')) return next(e)
@@ -212,11 +220,12 @@ export const register: Register = on => {
       model: 'haiku',
       system: RULES,
       prompt: `${previous}${taskTag}<request>${clip(e.text)}</request>`,
-      maxTokens: 64,
+      maxTokens: 256, // room for low-effort thinking plus the JSON with its flags
       effort: 'low',
       timeoutMs: 10000,
     })
     route = r.isAnswered ? parseRoute(r.text) : undefined
+    $.ui.log(`router: ${r.isAnswered ? r.text.trim() : `no answer (${r.reason})`}`, { to: 'debug' })
     // ponytail: the first 300 characters of the opening prompt; summarize the main work if that proves too thin.
     task ??= clip(e.text).slice(0, 300)
     const confirm = ((await $.store.get('confirm')) ?? ['effort', 'fable']) as Confirm[]
@@ -227,10 +236,14 @@ export const register: Register = on => {
     if (route && current && r.isAnswered && isNew(r.text) && !isDelegate(r.text)) {
       const handed = route
       route = last = { model: current, effort: 'low' }
+      handover = `subagent ${handed.model} · ${handed.effort}`
       return next({ ...e, context: [...(e.context ?? []), newTaskHint(handed)] })
     }
     // A long release step: the main model decides, a Haiku subagent runs it and keeps the log out.
-    if (route && r.isAnswered && isDelegate(r.text)) return next({ ...e, context: [...(e.context ?? []), DELEGATE_HINT] })
+    if (route && r.isAnswered && isDelegate(r.text)) {
+      handover = 'subagent haiku (deploy)'
+      return next({ ...e, context: [...(e.context ?? []), DELEGATE_HINT] })
+    }
     return next(e)
   }).catch(($, e, next) => next(e)) // classifier failed: the turn runs on the session's current model
 
@@ -256,7 +269,7 @@ export const register: Register = on => {
         current = tier
       }
       sent = { ...e, model: MODELS[tier], effort: route?.effort ?? e.effort }
-      $.ui.status(`router: ${tier} · ${sent.effort ?? 'default'}`)
+      $.ui.status(`router: ${tier} · ${sent.effort ?? 'default'}${handover ? ` → ${handover}` : ''}`)
     } else if (!e.agentId) {
       $.ui.status(undefined)
     }
