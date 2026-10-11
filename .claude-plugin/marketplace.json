@@ -1,0 +1,12 @@
+{
+  "name": "fatihkartal35",
+  "owner": { "name": "Fatih Kartal" },
+  "metadata": { "description": "Claude Code mods by Fatih Kartal" },
+  "plugins": [
+    {
+      "name": "auto-model-detector",
+      "source": "./auto-model-detector",
+      "description": "On Haiku, classifies each prompt and routes the turn to the right model and effort level."
+    }
+  ]
+}
