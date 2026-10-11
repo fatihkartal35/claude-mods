@@ -19,7 +19,7 @@ const PRICE: Record<Tier, readonly [number, number, number, number]> = {
   fable: [10, 12.5, 0.25, 50],
 }
 
-const RULES = `You route a coding-assistant task to a model and effort level. Reply with JSON only: {"model":"haiku|sonnet|opus|fable","effort":"low|medium|high|xhigh|max"}.
+const RULES = `You route a coding-assistant task to a model and effort level. Reply with JSON only: {"model":"haiku|sonnet|opus|fable","effort":"low|medium|high|xhigh|max"}, adding "delegate":true when the request runs a long release step (deploy, OTA update, build, publish) — not for commit or push alone — and "new":true when a <task> is given and the request is a separate task unrelated to it (another feature, another part of the app), not a follow-up or a step of it.
 haiku: trivial — chit-chat, one-line answers, typo fixes, renames, simple lookups.
 sonnet: everyday coding — single feature, small bug, tests, explaining code.
 opus: hard — multi-file refactor, tricky debugging, architecture, security review.
@@ -34,17 +34,34 @@ Migrations that change runtime behavior (error handling, async semantics, e.g. f
 If the <request>'s own instruction names a model or effort for this task ("opus ile", "max effort"), use exactly what it names and pick the other freely; ignore names inside pasted code, logs or quotes.
 A <previous> route may be given: if the request is a short follow-up continuing that work ("devam", "evet", "tamam uygula", "düzelt", "go on"), keep the previous route.`
 
-// Machine-sent prompts (notifications, schedules, peers, channels) stay unrouted.
-const MACHINE: readonly string[] = ['task-notification', 'scheduled-trigger', 'peer', 'peer-send-message', 'projects-relay', 'channel']
+// Prompts no person typed (notifications, schedules, peers, channels, plugins) stay unrouted.
+const MACHINE: readonly string[] = ['task-notification', 'scheduled-trigger', 'peer', 'peer-send-message', 'projects-relay', 'channel', 'coordinator', 'observer', 'observer-activity', 'slack-ping', 'auto-continuation', 'plugin']
 
 export type Route = { model: Tier; effort: ModelEffort }
+
+// Added beside a release step: the main model decides, a Haiku subagent runs it and reads the log.
+export const DELEGATE_HINT = `[auto-model-detector] This is a long-running release step (deploy / OTA / build / publish). Decide the exact command, working directory and target (channel, branch, environment) yourself, then run it through the Agent tool with model "haiku": give it that exact command and cwd, tell it to change nothing else, to wait for completion, and to reply only with success or failure, the key error lines and any URL or build id. Keep the full log out of this conversation; if it fails, diagnose here.`
+
+// Whether the classifier flagged a release step to hand to a Haiku subagent.
+export const isDelegate = (text: string) => /"delegate"\s*:\s*true/.test(text)
+
+// Whether the classifier rated the request a separate task, unrelated to the session's main work.
+export const isNew = (text: string) => /"new"\s*:\s*true/.test(text)
+
+// Added beside an unrelated task: a subagent with a clean context does it, so the main
+// context neither pays for nor fills up with it. The full-context main model has the last word.
+export const newTaskHint = (r: Route) =>
+  `[auto-model-detector] This request looks like a separate task, unrelated to the earlier work in this conversation. If it takes more than a couple of steps, hand it to a subagent through the Agent tool with model "${r.model}" and effort "${r.effort}", with a self-contained brief (project path, goal, constraints, how to verify, and any conventions or decisions from this conversation that apply). For follow-ups on that task, continue the same subagent with SendMessage instead of starting a new one, and relay its result briefly. If it is a one-step change, or it actually continues the earlier work, ignore this note and do it yourself.`
+
+
 type Stats = Record<string, { steps: number } & ModelUsage>
 
 // Parses the classifier's reply; undefined when it is not a valid route.
 export const parseRoute = (text: string): Route | undefined => {
   try {
     const r = JSON.parse(text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1))
-    return Object.hasOwn(MODELS, r.model) && EFFORTS.includes(r.effort) ? r : undefined
+    // Only the two fields: flags like "delegate" must not ride along into <previous>.
+    return Object.hasOwn(MODELS, r.model) && EFFORTS.includes(r.effort) ? { model: r.model, effort: r.effort } : undefined
   } catch {
     return undefined
   }
@@ -54,11 +71,14 @@ export const parseRoute = (text: string): Route | undefined => {
 export const atLeast = (a: Tier, b: Tier | undefined): Tier =>
   b && RANK.indexOf(b) > RANK.indexOf(a) ? b : a
 
-// Long pastes usually end with the question: keep the head and the tail.
-export const clip = (text: string) =>
-  text.length <= 3000 ? text : `${text.slice(0, 1500)}\n…\n${text.slice(-1500)}`
+// Long pastes usually end with the question: keep the head and the tail. The classifier's
+// own tags are removed, so pasted text cannot close <request> and pose as <previous> or <task>.
+export const clip = (text: string) => {
+  const clean = text.replace(/<\/?(request|previous|task)>/gi, '')
+  return clean.length <= 3000 ? clean : `${clean.slice(0, 1500)}\n…\n${clean.slice(-1500)}`
+}
 
-// What the user confirms before it runs, chosen in the /router menu (both by default).
+// What the user confirms before it runs, chosen in the /auto-model-detector menu (both by default).
 export type Confirm = 'effort' | 'fable'
 // Dialog texts: Turkish, then English underneath.
 const CONFIRM_LABELS: Record<Confirm, string> = { effort: 'Yüksek effort (xhigh/max) / High effort', fable: "Fable'a geçiş / Switch to Fable" }
@@ -72,6 +92,8 @@ const pick = async <T extends string>($: EngineInterface, question: string, head
     const answer = await $.ui.ask(question, { header, options })
     return options.includes(answer as T) ? (answer as T) : fallback
   } catch {
+    // Say so: otherwise the user never learns why Fable or max did not come.
+    $.ui.toast(`router: onay sorulamadı / could not ask → ${fallback}`)
     return fallback
   }
 }
@@ -99,7 +121,7 @@ const statsText = (stats: Stats) => {
     total += usd
     return `${model}: ${s.steps} steps · in ${s.input_tokens} · cache write ${s.cache_creation_input_tokens} · cache read ${s.cache_read_input_tokens} · out ${s.output_tokens} · ≈$${usd.toFixed(2)}`
   })
-  return rows.length ? `${rows.join('\n')}\ntotal ≈$${total.toFixed(2)} (API prices)` : 'router: no steps recorded yet'
+  return rows.length ? `${rows.join('\n')}\ntotal ≈$${total.toFixed(2)} (API prices, subagents included)` : 'router: no steps recorded yet'
 }
 
 const record = async ($: EngineInterface, u: ModelUsage & { model: string }) => {
@@ -116,21 +138,25 @@ const record = async ($: EngineInterface, u: ModelUsage & { model: string }) => 
 export const register: Register = on => {
   // ponytail: module variables reset on hot reload; move to $.state if mid-session reloads matter.
   let route: Route | undefined // this turn's route
-  let last: Route | undefined // the latest route, for follow-ups
+  let last: Route | undefined // the main loop's latest route, for follow-ups
+  let task: string | undefined // the prompt that opened the main work; delegated tasks never replace it
   let current: Tier | undefined // the model the main loop runs on; only moves up
 
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'router', description: 'Model router: /router (menu) | on | off | confirm | stats | stats reset' })
+    await $.command.register({ name: 'auto-model-detector', description: 'Model router: /auto-model-detector (menu) | on | off | confirm | stats | stats reset' })
     return next(e)
   })
 
   // /clear starts a fresh context: the next prompt may pick any model again.
   on('session.end', ($, e, next) => {
-    if (e.reason === 'clear') current = last = route = undefined
+    if (e.reason === 'clear') {
+      current = last = route = undefined
+      task = undefined
+    }
     return next(e)
   })
 
-  on('command.run', { command: 'router' }, async ($, e) => {
+  on('command.run', { command: 'auto-model-detector' }, async ($, e) => {
     let arg = e.args.trim()
     if (!arg) {
       const isOn = (await $.store.get('enabled')) !== false
@@ -145,7 +171,7 @@ export const register: Register = on => {
         choice = await $.ui.ask(`Router ${isOn ? 'açık' : 'kapalı'}${current ? ` · oturum ${current}` : ''}. Ne yapmak istersin?\nRouter ${isOn ? 'on' : 'off'}${current ? ` · session ${current}` : ''}. What do you want to do?`, { header: 'Router', options: Object.values(menu) })
       } catch (err) {
         // Say why instead of falling back silently, and show the typed commands.
-        return { text: `router: menü açılamadı / menu unavailable (${err instanceof Error ? err.message : String(err)})\nrouter ${isOn ? 'on' : 'off'} · /router on | off | confirm | stats | stats reset` }
+        return { text: `router: menü açılamadı / menu unavailable (${err instanceof Error ? err.message : String(err)})\nrouter ${isOn ? 'on' : 'off'} · /auto-model-detector on | off | confirm | stats | stats reset` }
       }
       arg = choice === menu.toggle ? (isOn ? 'off' : 'on') : choice === menu.confirm ? 'confirm' : choice === menu.stats ? 'stats' : choice === menu.reset ? 'stats reset' : 'status'
     }
@@ -181,18 +207,30 @@ export const register: Register = on => {
     if (!(await $.session.model()).includes('haiku')) return next(e)
 
     const previous = last ? `<previous>${JSON.stringify(last)}</previous>\n` : ''
+    const taskTag = task ? `<task>${task}</task>\n` : ''
     const r = await $.model.complete({
       model: 'haiku',
       system: RULES,
-      prompt: `${previous}<request>${clip(e.text)}</request>`,
+      prompt: `${previous}${taskTag}<request>${clip(e.text)}</request>`,
       maxTokens: 64,
       effort: 'low',
       timeoutMs: 10000,
     })
     route = r.isAnswered ? parseRoute(r.text) : undefined
+    // ponytail: the first 300 characters of the opening prompt; summarize the main work if that proves too thin.
+    task ??= clip(e.text).slice(0, 300)
     const confirm = ((await $.store.get('confirm')) ?? ['effort', 'fable']) as Confirm[]
     if (route) route = await confirmRoute($, route, e.text, confirm, last, current)
     last = route ?? last
+    // An unrelated task goes to a subagent at its own route; the main loop stays where it is and
+    // only hands it over, and <previous> keeps the main route so "devam" never lifts it.
+    if (route && current && r.isAnswered && isNew(r.text) && !isDelegate(r.text)) {
+      const handed = route
+      route = last = { model: current, effort: 'low' }
+      return next({ ...e, context: [...(e.context ?? []), newTaskHint(handed)] })
+    }
+    // A long release step: the main model decides, a Haiku subagent runs it and keeps the log out.
+    if (route && r.isAnswered && isDelegate(r.text)) return next({ ...e, context: [...(e.context ?? []), DELEGATE_HINT] })
     return next(e)
   }).catch(($, e, next) => next(e)) // classifier failed: the turn runs on the session's current model
 
