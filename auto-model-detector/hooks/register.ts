@@ -40,7 +40,7 @@ Principles:
 - Release chores keep the <previous> model at effort low, even when they touch risky code.
 - If the <request> itself names a model or effort ("opus ile", "max effort"), use it; ignore names inside pasted code, logs or quotes.
 - A short follow-up to the <previous> work ("devam", "evet", "tamam uygula", "düzelt", "go on") keeps the <previous> route.
-- When no rule clearly fits, choose sonnet · medium.`
+- When no rule clearly fits, add "unsure":true and still give your best guess.`
 
 // Prompts no person typed (notifications, schedules, peers, channels, plugins) stay unrouted.
 const MACHINE: readonly string[] = ['task-notification', 'scheduled-trigger', 'peer', 'peer-send-message', 'projects-relay', 'channel', 'coordinator', 'observer', 'observer-activity', 'slack-ping', 'auto-continuation', 'plugin']
@@ -55,6 +55,9 @@ export const DELEGATE_HINT = `[auto-model-detector] This is a long-running relea
 
 // Whether the classifier flagged a release step to hand to a Haiku subagent.
 export const isDelegate = (text: string) => /"delegate"\s*:\s*true/.test(text)
+
+// Whether the classifier said no rule clearly fits; the router then asks again at medium effort.
+export const isUnsure = (text: string) => /"unsure"\s*:\s*true/.test(text)
 
 // Whether the classifier rated the request a separate task, unrelated to the session's main work.
 export const isNew = (text: string) => /"new"\s*:\s*true/.test(text)
@@ -220,16 +223,26 @@ export const register: Register = on => {
 
     const previous = last ? `<previous>${JSON.stringify(last)}</previous>\n` : ''
     const taskTag = task ? `<task>${task}</task>\n` : ''
-    const r = await $.model.complete({
-      model: 'haiku',
-      system: RULES,
-      prompt: `${previous}${taskTag}<request>${clip(e.text)}</request>`,
-      maxTokens: 1024, // room for medium-effort thinking plus the JSON with its flags
-      effort: 'medium', // reads the rules' intent, not just their words; ~0.5–1 s more than low
-      timeoutMs: 15000,
-    })
-    route = (r.isAnswered ? parseRoute(r.text) : undefined) ?? FALLBACK
-    $.ui.log(`router: ${r.isAnswered ? r.text.trim() : `no answer (${r.reason})`}`, { to: 'debug' })
+    // Low effort first (~1 s); only a request it is unsure of, or cannot answer, is asked again at
+    // medium effort; if that is unsure too, the route is sonnet · medium.
+    const prompt = `${previous}${taskTag}<request>${clip(e.text)}</request>`
+    let text = ''
+    for (const effort of ['low', 'medium'] as const) {
+      const r = await $.model.complete({
+        model: 'haiku',
+        system: RULES,
+        prompt,
+        maxTokens: effort === 'low' ? 256 : 1024, // room for thinking plus the JSON with its flags
+        effort,
+        timeoutMs: effort === 'low' ? 10000 : 15000,
+      })
+      $.ui.log(`router (${effort}): ${r.isAnswered ? r.text.trim() : `no answer (${r.reason})`}`, { to: 'debug' })
+      if (r.isAnswered && parseRoute(r.text) && !isUnsure(r.text)) {
+        text = r.text
+        break
+      }
+    }
+    route = parseRoute(text) ?? FALLBACK
     // ponytail: the first 300 characters of the opening prompt; summarize the main work if that proves too thin.
     task ??= clip(e.text).slice(0, 300)
     const confirm = ((await $.store.get('confirm')) ?? ['effort', 'fable']) as Confirm[]
@@ -237,14 +250,14 @@ export const register: Register = on => {
     last = route ?? last
     // An unrelated task goes to a subagent at its own route; the main loop stays where it is and
     // only hands it over, and <previous> keeps the main route so "devam" never lifts it.
-    if (route && current && r.isAnswered && isNew(r.text) && !isDelegate(r.text)) {
+    if (route && current && isNew(text) && !isDelegate(text)) {
       const handed = route
       route = last = { model: current, effort: 'low' }
       handover = `subagent ${handed.model} · ${handed.effort}`
       return next({ ...e, context: [...(e.context ?? []), newTaskHint(handed)] })
     }
     // A long release step: the main model decides, a Haiku subagent runs it and keeps the log out.
-    if (route && r.isAnswered && isDelegate(r.text)) {
+    if (route && isDelegate(text)) {
       handover = 'subagent haiku (deploy)'
       return next({ ...e, context: [...(e.context ?? []), DELEGATE_HINT] })
     }

@@ -28,7 +28,7 @@ Installed at the user scope, it also loads in Claude Desktop's Code tab.
 - Short follow-ups ("devam", "go on") keep the previous route.
 - Naming a model or effort in the prompt ("opus ile", "max effort") wins.
 - Before **xhigh/max** effort or a switch to **Fable**, it asks you. Both are on by default; change them with `/auto-model-detector confirm`. If the dialog cannot open, it falls back to high / opus and says so.
-- When no rule clearly fits, or the classifier gives no usable answer, it lands on sonnet · medium (never below the session's current model).
+- When the quick (low-effort) answer is unsure, Haiku is asked again at medium effort; if that is unsure too, or there is no usable answer, it lands on sonnet · medium (never below the session's current model).
 - Does nothing unless the session's own model is Haiku.
 - General-purpose subagents follow the session's model (capped at opus); typed subagents (Explore, Plan …) keep their own model.
 
@@ -56,7 +56,7 @@ The status line shows the current choice as `router: opus · high`, plus any han
 
 ### Cost / Maliyet
 
-One Haiku call per prompt at medium effort (≈ $0.0002–0.0004, ~1.5–2 s). Stats use API list prices from `PRICE` in `auto-model-detector/hooks/register.ts` (cache write assumed 1.25× input; Haiku's above-100K tier ignored) and include subagent steps. On a subscription the savings show up as usage-limit headroom.
+One Haiku call per prompt at low effort (≈ $0.0001–0.0002, ~1 s); only when it is unsure, a second call at medium effort (~1.5–2 s more). Stats use API list prices from `PRICE` in `auto-model-detector/hooks/register.ts` (cache write assumed 1.25× input; Haiku's above-100K tier ignored) and include subagent steps. On a subscription the savings show up as usage-limit headroom.
 
 ### Customize / Özelleştir
 

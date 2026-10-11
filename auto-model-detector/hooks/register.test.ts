@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { DELEGATE_HINT, FALLBACK, atLeast, clip, isDelegate, newTaskHint, parseRoute } from './register'
+import { DELEGATE_HINT, FALLBACK, atLeast, isUnsure, clip, isDelegate, newTaskHint, parseRoute } from './register'
 
 const usage = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
 
@@ -26,6 +26,7 @@ const engine = (on: any, sessionModel: string, replies: string[], pick = (labels
   const m = new Map<string, unknown>()
   const sent: { model: string; effort?: unknown }[] = []
   const asked: string[] = []
+  const efforts: string[] = []
   const questions: string[] = []
   const contexts: string[][] = []
   on('tool.call', { tool: 'AskUserQuestion' }, (_: unknown, e: any) => {
@@ -39,6 +40,7 @@ const engine = (on: any, sessionModel: string, replies: string[], pick = (labels
   on('session.usage', () => ({ value: { startedAt: 0, context: { tokens: 50000, window: 1e6 }, rateLimits: [] } }))
   on('model.complete', (_: unknown, e: any) => {
     asked.push(e.prompt)
+    efforts.push(e.effort)
     return { value: { isAnswered: true, text: replies.shift() ?? 'garbage', usage } } as never
   })
   on('prompt.submit', (_: unknown, e: any) => (contexts.push(e.context ?? []), { text: e.text }))
@@ -46,7 +48,7 @@ const engine = (on: any, sessionModel: string, replies: string[], pick = (labels
     sent.push({ model: e.model, effort: e.effort })
     return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: { ...usage, model: e.model } }
   })
-  return { sent, asked, questions, contexts, store: m }
+  return { sent, asked, efforts, questions, contexts, store: m }
 }
 
 const turn = async ($: any, text: string) => {
@@ -73,6 +75,7 @@ test('only moves up: opus stays opus, effort still follows the route', async ($:
     '{"model":"opus","effort":"high"}',
     '{"model":"haiku","effort":"low"}',
     'garbage',
+    'garbage', // the medium retry is unusable too → fallback
     '{"model":"fable","effort":"max"}',
   ])
   await turn($, 'ödemelerde fiyatlar tutmuyor')
@@ -102,7 +105,7 @@ test('/auto-model-detector off stops classifying; stats records usage', async ($
   expect(asked).toHaveLength(0)
   await $.command.run({ command: 'auto-model-detector', args: 'on' })
   await turn($, 'x')
-  expect(asked).toHaveLength(1)
+  expect(asked).toHaveLength(2) // no usable answer: low, then the medium retry
   expect((await $.command.run({ command: 'auto-model-detector', args: 'stats' })).text).toContain('claude-sonnet-5-5: 1 steps') // no usable answer → sonnet · medium
 })
 
@@ -246,7 +249,7 @@ test('no new-task handover on the first prompt', async ($: any, on) => {
 
 test('an unusable classifier answer lands on sonnet · medium, never below the session', async ($: any, on) => {
   expect(FALLBACK).toEqual({ model: 'sonnet', effort: 'medium' })
-  const { sent } = engine(on, 'claude-haiku-5-5', ['garbage', '{"model":"opus","effort":"high"}', 'garbage'])
+  const { sent } = engine(on, 'claude-haiku-5-5', ['garbage', 'garbage', '{"model":"opus","effort":"high"}', 'garbage', 'garbage'])
   await turn($, 'x')
   await turn($, 'y')
   await turn($, 'z')
@@ -254,5 +257,25 @@ test('an unusable classifier answer lands on sonnet · medium, never below the s
     { model: 'claude-sonnet-5-5', effort: 'medium' },
     { model: 'claude-opus-5-5', effort: 'high' },
     { model: 'claude-opus-5-5', effort: 'medium' },
+  ])
+})
+
+test('low effort first; unsure → medium; unsure again → sonnet · medium', async ($: any, on) => {
+  expect(isUnsure('{"model":"opus","effort":"high","unsure":true}')).toBe(true)
+  const { sent, efforts } = engine(on, 'claude-haiku-5-5', [
+    '{"model":"haiku","effort":"low"}',
+    '{"model":"opus","effort":"high","unsure":true}',
+    '{"model":"sonnet","effort":"high"}',
+    '{"model":"opus","effort":"high","unsure":true}',
+    '{"model":"opus","effort":"high","unsure":true}',
+  ])
+  await turn($, 'merhaba')
+  await turn($, 'tuhaf bir istek')
+  await turn($, 'daha da tuhaf bir istek')
+  expect(efforts).toEqual(['low', 'low', 'medium', 'low', 'medium'])
+  expect(sent).toEqual([
+    { model: 'claude-haiku-5-5', effort: 'low' },
+    { model: 'claude-sonnet-5-5', effort: 'high' },
+    { model: 'claude-sonnet-5-5', effort: 'medium' },
   ])
 })
