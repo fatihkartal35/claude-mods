@@ -39,12 +39,16 @@ Principles:
 - What makes a bug hard is not knowing where it lives, not vague wording: "prices don't match" can hide anywhere (opus · high); "buttons shift on the home page" sits in one place (sonnet · medium).
 - Release chores keep the <previous> model at effort low, even when they touch risky code.
 - If the <request> itself names a model or effort ("opus ile", "max effort"), use it; ignore names inside pasted code, logs or quotes.
-- A short follow-up to the <previous> work ("devam", "evet", "tamam uygula", "düzelt", "go on") keeps the <previous> route.`
+- A short follow-up to the <previous> work ("devam", "evet", "tamam uygula", "düzelt", "go on") keeps the <previous> route.
+- When no rule clearly fits, choose sonnet · medium.`
 
 // Prompts no person typed (notifications, schedules, peers, channels, plugins) stay unrouted.
 const MACHINE: readonly string[] = ['task-notification', 'scheduled-trigger', 'peer', 'peer-send-message', 'projects-relay', 'channel', 'coordinator', 'observer', 'observer-activity', 'slack-ping', 'auto-continuation', 'plugin']
 
 export type Route = { model: Tier; effort: ModelEffort }
+
+// Where the router lands when nothing fits or the classifier gives no usable answer.
+export const FALLBACK: Route = { model: 'sonnet', effort: 'medium' }
 
 // Added beside a release step: the main model decides, a Haiku subagent runs it and reads the log.
 export const DELEGATE_HINT = `[auto-model-detector] This is a long-running release step (deploy / OTA / build / publish). Decide the exact command, working directory and target (channel, branch, environment) yourself, then run it through the Agent tool with model "haiku": give it that exact command and cwd, tell it to change nothing else, to wait for completion, and to reply only with success or failure, the key error lines and any URL or build id. Keep the full log out of this conversation; if it fails, diagnose here.`
@@ -220,11 +224,11 @@ export const register: Register = on => {
       model: 'haiku',
       system: RULES,
       prompt: `${previous}${taskTag}<request>${clip(e.text)}</request>`,
-      maxTokens: 256, // room for low-effort thinking plus the JSON with its flags
-      effort: 'low',
-      timeoutMs: 10000,
+      maxTokens: 1024, // room for medium-effort thinking plus the JSON with its flags
+      effort: 'medium', // reads the rules' intent, not just their words; ~0.5–1 s more than low
+      timeoutMs: 15000,
     })
-    route = r.isAnswered ? parseRoute(r.text) : undefined
+    route = (r.isAnswered ? parseRoute(r.text) : undefined) ?? FALLBACK
     $.ui.log(`router: ${r.isAnswered ? r.text.trim() : `no answer (${r.reason})`}`, { to: 'debug' })
     // ponytail: the first 300 characters of the opening prompt; summarize the main work if that proves too thin.
     task ??= clip(e.text).slice(0, 300)
@@ -245,7 +249,11 @@ export const register: Register = on => {
       return next({ ...e, context: [...(e.context ?? []), DELEGATE_HINT] })
     }
     return next(e)
-  }).catch(($, e, next) => next(e)) // classifier failed: the turn runs on the session's current model
+  }).catch(($, e, next) => {
+    // The classifier call itself threw: same landing as an unusable answer.
+    route ??= FALLBACK
+    return next(e)
+  })
 
   // A general-purpose subagent runs on the session's routed model, capped at opus.
   // ponytail: typed subagents (Explore, Plan...) keep their own model; route them too if needed.

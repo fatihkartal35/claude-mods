@@ -1,1 +1,1 @@
-{ "name": "auto-model-detector", "version": "0.3.1", "description": "On Haiku, classifies each prompt and routes the turn to the right model and effort level.", "author": { "name": "Fatih Kartal" } }
+{ "name": "auto-model-detector", "version": "0.3.2", "description": "On Haiku, classifies each prompt and routes the turn to the right model and effort level.", "author": { "name": "Fatih Kartal" } }

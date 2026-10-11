@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { DELEGATE_HINT, atLeast, clip, isDelegate, newTaskHint, parseRoute } from './register'
+import { DELEGATE_HINT, FALLBACK, atLeast, clip, isDelegate, newTaskHint, parseRoute } from './register'
 
 const usage = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
 
@@ -103,7 +103,7 @@ test('/auto-model-detector off stops classifying; stats records usage', async ($
   await $.command.run({ command: 'auto-model-detector', args: 'on' })
   await turn($, 'x')
   expect(asked).toHaveLength(1)
-  expect((await $.command.run({ command: 'auto-model-detector', args: 'stats' })).text).toContain('claude-haiku-5-5: 1 steps')
+  expect((await $.command.run({ command: 'auto-model-detector', args: 'stats' })).text).toContain('claude-sonnet-5-5: 1 steps') // no usable answer → sonnet · medium
 })
 
 test('asks before xhigh/max, not when the user named it', async ($: any, on) => {
@@ -242,4 +242,17 @@ test('no new-task handover on the first prompt', async ($: any, on) => {
   await turn($, NEW_TASK.web)
   expect(contexts[0]).toEqual([])
   expect(sent[0]).toEqual({ model: 'claude-sonnet-5-5', effort: 'medium' })
+})
+
+test('an unusable classifier answer lands on sonnet · medium, never below the session', async ($: any, on) => {
+  expect(FALLBACK).toEqual({ model: 'sonnet', effort: 'medium' })
+  const { sent } = engine(on, 'claude-haiku-5-5', ['garbage', '{"model":"opus","effort":"high"}', 'garbage'])
+  await turn($, 'x')
+  await turn($, 'y')
+  await turn($, 'z')
+  expect(sent).toEqual([
+    { model: 'claude-sonnet-5-5', effort: 'medium' },
+    { model: 'claude-opus-5-5', effort: 'high' },
+    { model: 'claude-opus-5-5', effort: 'medium' },
+  ])
 })
